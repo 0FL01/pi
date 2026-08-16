@@ -28,9 +28,11 @@ import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
+	Context,
 	ImageContent,
 	Model,
 	ProviderHeaders,
+	SimpleStreamOptions,
 	TextContent,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
@@ -1782,6 +1784,32 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private async _createCacheFriendlyCompactionRequest(signal: AbortSignal) {
+		const state = this.agent.state;
+		const model = state.model;
+		const systemPrompt = state.systemPrompt;
+		const tools = state.tools.slice();
+		let messages = state.messages.slice();
+		if (this.agent.transformContext) {
+			messages = await this.agent.transformContext(messages, signal);
+		}
+		const llmMessages = await this.agent.convertToLlm(messages);
+		const apiKey = await this.agent.getApiKey?.(model.provider);
+		const options: SimpleStreamOptions = {
+			apiKey,
+			reasoning: state.thinkingLevel === "off" ? undefined : state.thinkingLevel,
+			sessionId: this.agent.sessionId,
+			onPayload: this.agent.onPayload,
+			onResponse: this.agent.onResponse,
+			transport: this.agent.transport,
+			thinkingBudgets: this.agent.thinkingBudgets,
+			maxRetryDelayMs: this.agent.maxRetryDelayMs,
+			signal,
+		};
+		const context: Context = { systemPrompt, messages: llmMessages, tools };
+		return { model, context, options, streamFn: this.agent.streamFunction };
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -1863,6 +1891,7 @@ export class AgentSession {
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
+					() => this._createCacheFriendlyCompactionRequest(this._compactionAbortController!.signal),
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2135,6 +2164,9 @@ export class AgentSession {
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason }),
+					reason === "threshold"
+						? () => this._createCacheFriendlyCompactionRequest(this._autoCompactionAbortController!.signal)
+						: undefined,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;

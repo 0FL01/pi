@@ -20,7 +20,7 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+Both use the same structured summary format and track file operations cumulatively. By default, compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused. The opt-in `compaction.cacheFriendly` path instead appends the summary instruction to the current OpenAI-compatible request prefix when it fits, preserving provider prompt-cache reuse; it falls back to standalone summarization on overflow or failure.
 
 ## Compaction
 
@@ -387,7 +387,8 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "cacheFriendly": false
   }
 }
 ```
@@ -397,5 +398,6 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | `enabled` | `true` | Enable auto-compaction |
 | `reserveTokens` | `16384` | Tokens to reserve for LLM response |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `cacheFriendly` | `false` | Reuse the current OpenAI-compatible request prefix for manual and threshold summaries when it fits; fall back to standalone summarization otherwise |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.

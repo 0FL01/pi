@@ -115,13 +115,15 @@ Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--off
 | `compaction.enabled` | boolean | `true` | Enable auto-compaction |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.cacheFriendly` | boolean | `false` | For OpenAI-compatible local providers, summarize from the current request prefix when it fits; otherwise use standalone summarization |
 
 ```json
 {
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "cacheFriendly": false
   }
 }
 ```

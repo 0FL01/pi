@@ -13,6 +13,7 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	cacheFriendly?: boolean; // default: false
 }
 
 export interface BranchSummarySettings {
@@ -783,11 +784,21 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionCacheFriendly(): boolean {
+		return this.settings.compaction?.cacheFriendly ?? false;
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentTokens: number;
+		cacheFriendly: boolean;
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			cacheFriendly: this.getCompactionCacheFriendly(),
 		};
 	}
 

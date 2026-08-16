@@ -7,6 +7,7 @@
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { contentText, type RetryCallbacks, type RetryPolicy, retryAssistantCall, uuidv7 } from "@earendil-works/pi-ai";
+import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { convertToLlm } from "../messages.ts";
@@ -127,12 +128,14 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	cacheFriendly?: boolean;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	cacheFriendly: false,
 };
 
 // ============================================================================
@@ -807,6 +810,60 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.`;
 
+interface CacheFriendlyCompactionRequest {
+	model: Model<any>;
+	context: Context;
+	options: SimpleStreamOptions;
+	streamFn: StreamFn;
+}
+
+async function generateCacheFriendlySummary(
+	request: CacheFriendlyCompactionRequest,
+	reserveTokens: number,
+	customInstructions: string | undefined,
+): Promise<{ text: string; usage: Usage } | undefined> {
+	if (request.model.api !== "openai-completions" || request.model.contextWindow <= 0) return undefined;
+
+	let prompt = SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		prompt = `${prompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+	const context: Context = {
+		...request.context,
+		messages: [
+			...request.context.messages,
+			{
+				role: "user",
+				content: [{ type: "text", text: prompt }],
+				timestamp: Date.now(),
+			},
+		],
+	};
+	const requestedMaxTokens = Math.min(
+		Math.floor(0.8 * reserveTokens),
+		request.model.maxTokens > 0 ? request.model.maxTokens : Number.POSITIVE_INFINITY,
+	);
+	if (!Number.isFinite(requestedMaxTokens) || requestedMaxTokens <= 1) return undefined;
+	const maxTokens = clampMaxTokensToContext(request.model, context, requestedMaxTokens);
+	if (maxTokens <= 1) return undefined;
+
+	const options: SimpleStreamOptions & { toolChoice: "none" } = {
+		...request.options,
+		maxTokens,
+		toolChoice: "none",
+	};
+	const stream = await request.streamFn(request.model, context, options);
+	const response = await stream.result();
+	if (
+		(response.stopReason !== "stop" && response.stopReason !== "length") ||
+		response.content.some((content) => content.type === "toolCall")
+	) {
+		return undefined;
+	}
+	const text = contentText(response.content).trim();
+	return text ? { text, usage: response.usage } : undefined;
+}
+
 /**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
@@ -826,6 +883,7 @@ export async function compact(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	createCacheFriendlyRequest?: () => Promise<CacheFriendlyCompactionRequest>,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -841,8 +899,23 @@ export async function compact(
 	// Generate summaries and merge into one
 	let summary: string;
 	let summaryUsage: Usage;
+	let cacheFriendlyResult: { text: string; usage: Usage } | undefined;
+	if (settings.cacheFriendly && createCacheFriendlyRequest) {
+		try {
+			cacheFriendlyResult = await generateCacheFriendlySummary(
+				await createCacheFriendlyRequest(),
+				settings.reserveTokens,
+				customInstructions,
+			);
+		} catch (error) {
+			if (signal?.aborted) throw error;
+		}
+	}
 
-	if (isSplitTurn && turnPrefixMessages.length > 0) {
+	if (cacheFriendlyResult) {
+		summary = cacheFriendlyResult.text;
+		summaryUsage = cacheFriendlyResult.usage;
+	} else if (isSplitTurn && turnPrefixMessages.length > 0) {
 		let historyText = "No prior history.";
 		let historyUsage: Usage | undefined;
 		if (messagesToSummarize.length > 0) {

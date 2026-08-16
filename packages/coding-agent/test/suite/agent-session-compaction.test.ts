@@ -1,8 +1,10 @@
 import {
 	type AssistantMessage,
+	type Context,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	type Model,
+	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
@@ -65,6 +67,36 @@ function useSummaryStreamFn(harness: Harness, summary: string): () => number {
 		return stream;
 	};
 	return () => callCount;
+}
+
+type StreamCall = {
+	context: Context;
+	options: (SimpleStreamOptions & { toolChoice?: string }) | undefined;
+};
+
+function useCapturedStreamFn(harness: Harness, responses: AssistantMessage[]): StreamCall[] {
+	const calls: StreamCall[] = [];
+	harness.session.agent.streamFunction = (model, context, options) => {
+		calls.push({ context, options });
+		const response = responses.shift();
+		if (!response) throw new Error("Missing test response");
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(() => {
+			const message = { ...response, api: model.api, provider: model.provider, model: model.id };
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				stream.push({ type: "error", reason: message.stopReason, error: message });
+			} else if (message.stopReason !== "pending") {
+				stream.push({ type: "done", reason: message.stopReason, message });
+			}
+		});
+		return stream;
+	};
+	return calls;
+}
+
+function enableCacheFriendlyModel(harness: Harness): void {
+	harness.session.agent.state.model = { ...harness.getModel(), api: "openai-completions" };
+	harness.session.agent.sessionId = "cache-friendly-session";
 }
 
 function seedCompactableSession(harness: Harness): void {
@@ -276,6 +308,89 @@ describe("AgentSession compaction characterization", () => {
 		expect(compactionEntries).toHaveLength(1);
 		expect(compactionEnd?.result?.estimatedTokensAfter).toBeGreaterThan(0);
 		expect(getStreamCallCount()).toBe(1);
+	});
+
+	it("manually summarizes from the current provider prefix when cache-friendly compaction is enabled", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { cacheFriendly: true, keepRecentTokens: 1, reserveTokens: 8192 } },
+			systemPrompt: "cache-friendly system prompt",
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		enableCacheFriendlyModel(harness);
+		harness.session.agent.transformContext = async (messages) => [
+			...messages,
+			{ role: "user", content: [{ type: "text", text: "transformed marker" }], timestamp: Date.now() },
+		];
+		const currentSystemPrompt = harness.session.agent.state.systemPrompt;
+		const calls = useCapturedStreamFn(harness, [
+			{ ...fauxAssistantMessage("cache-friendly summary"), usage: createUsage(17) },
+		]);
+
+		const result = await harness.session.compact("preserve exact decisions");
+
+		expect(result.summary).toContain("cache-friendly summary");
+		expect(result.usage).toEqual(createUsage(17));
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.context.systemPrompt).toBe(currentSystemPrompt);
+		expect(calls[0]?.context.messages.at(-2)?.role).toBe("user");
+		expect(calls[0]?.context.messages.at(-2)?.content).toEqual([{ type: "text", text: "transformed marker" }]);
+		expect(calls[0]?.context.messages.at(-1)?.role).toBe("user");
+		expect(calls[0]?.context.messages.at(-1)?.content).toEqual([
+			expect.objectContaining({
+				type: "text",
+				text: expect.stringContaining("Additional focus: preserve exact decisions"),
+			}),
+		]);
+		expect(calls[0]?.options?.sessionId).toBe("cache-friendly-session");
+		expect(calls[0]?.options?.toolChoice).toBe("none");
+		expect(calls[0]?.options?.cacheRetention).toBeUndefined();
+		expect(calls[0]?.options?.maxTokens).toBeGreaterThan(1);
+	});
+
+	it("falls back to standalone summarization when a cache-friendly threshold request fails", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { cacheFriendly: true, keepRecentTokens: 1, reserveTokens: 8192 } },
+			systemPrompt: "normal system prompt",
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		enableCacheFriendlyModel(harness);
+		const currentSystemPrompt = harness.session.agent.state.systemPrompt;
+		const calls = useCapturedStreamFn(harness, [
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "cache-friendly failed" }),
+			{ ...fauxAssistantMessage("standalone summary"), usage: createUsage(23) },
+		]);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0]?.context.systemPrompt).toBe(currentSystemPrompt);
+		expect(calls[0]?.options?.toolChoice).toBe("none");
+		expect(calls[1]?.context.systemPrompt).not.toBe(currentSystemPrompt);
+		expect(calls[1]?.options?.cacheRetention).toBe("none");
+		expect(calls[1]?.options?.sessionId).not.toBe("cache-friendly-session");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+	});
+
+	it("uses standalone summarization for overflow even when cache-friendly compaction is enabled", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { cacheFriendly: true, keepRecentTokens: 1, reserveTokens: 8192 } },
+			systemPrompt: "normal system prompt",
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		enableCacheFriendlyModel(harness);
+		const currentSystemPrompt = harness.session.agent.state.systemPrompt;
+		const calls = useCapturedStreamFn(harness, [fauxAssistantMessage("overflow summary")]);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await sessionInternals._runAutoCompaction("overflow", false);
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.context.systemPrompt).not.toBe(currentSystemPrompt);
+		expect(calls[0]?.options?.cacheRetention).toBe("none");
 	});
 
 	it("compacts and resumes after a length stop below the desired output limit", async () => {
