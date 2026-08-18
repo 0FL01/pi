@@ -1,11 +1,14 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	type Context,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
+	fauxToolCall,
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
@@ -346,6 +349,54 @@ describe("AgentSession compaction characterization", () => {
 		expect(calls[0]?.options?.toolChoice).toBe("none");
 		expect(calls[0]?.options?.cacheRetention).toBeUndefined();
 		expect(calls[0]?.options?.maxTokens).toBeGreaterThan(1);
+	});
+
+	it("compacts and resumes before another tool turn crosses the context limit", async () => {
+		const toolRuns: string[] = [];
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async (_toolCallId, params) => {
+				const text = typeof params === "object" && params !== null && "text" in params ? String(params.text) : "";
+				toolRuns.push(text);
+				return { content: [{ type: "text", text: `echo:${text}` }], details: { text } };
+			},
+		};
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 20_000, maxTokens: 4096 }],
+			settings: { compaction: { cacheFriendly: true, keepRecentTokens: 1, reserveTokens: 8192 } },
+			tools: [echoTool],
+			initialActiveToolNames: ["echo"],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 500 } });
+		enableCacheFriendlyModel(harness);
+		const toolResponse = {
+			...fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
+			usage: createUsage(12_000),
+		};
+		const calls = useCapturedStreamFn(harness, [
+			toolResponse,
+			{ ...fauxAssistantMessage("tool-loop summary"), usage: createUsage(17) },
+			{ ...fauxAssistantMessage("continued after compaction"), usage: createUsage(100) },
+		]);
+
+		await harness.session.prompt(`continue the task ${"x".repeat(4000)}`);
+
+		expect(toolRuns).toEqual(["hello"]);
+		expect(calls).toHaveLength(3);
+		expect(calls[1]?.options?.toolChoice).toBe("none");
+		expect(calls[1]?.context.messages.some((message) => message.role === "toolResult")).toBe(true);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "threshold",
+			aborted: false,
+			willRetry: true,
+		});
+		expect(harness.session.getLastAssistantText()).toBe("continued after compaction");
 	});
 
 	it("falls back to standalone summarization when a cache-friendly threshold request fails", async () => {

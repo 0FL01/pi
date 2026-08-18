@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added opt-in cache-friendly compaction summaries for OpenAI-compatible local providers, with automatic fallback to standalone summarization.
+- Added opt-in cache-friendly compaction summaries for OpenAI-compatible local providers, including proactive compaction between tool turns, with automatic fallback to standalone summarization.
 
 ## [0.84.1] - 2026-08-07
 

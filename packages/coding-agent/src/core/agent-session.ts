@@ -328,6 +328,7 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	private _resumeAfterThresholdStop = false;
 	private _overflowRecoveryAttempted = false;
 
 	// Branch summarization state
@@ -397,6 +398,7 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
+		this._installAgentCompactionStop();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -554,6 +556,38 @@ export class AgentSession {
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
+		};
+	}
+
+	private _installAgentCompactionStop(): void {
+		const previousShouldStopAfterTurn = this.agent.shouldStopAfterTurn;
+		this.agent.shouldStopAfterTurn = async (turn, signal) => {
+			if (await previousShouldStopAfterTurn?.(turn, signal)) {
+				return true;
+			}
+
+			const settings = this.settingsManager.getCompactionSettings();
+			const model = this.agent.state.model;
+			if (
+				!settings.enabled ||
+				!settings.cacheFriendly ||
+				turn.message.stopReason !== "toolUse" ||
+				turn.message.provider !== model.provider ||
+				turn.message.model !== model.id
+			) {
+				return false;
+			}
+
+			const contextTokens = Math.max(
+				calculateContextTokens(turn.message.usage),
+				estimateContextTokens(turn.context.messages).tokens,
+			);
+			if (!shouldCompact(contextTokens, model.contextWindow, settings)) {
+				return false;
+			}
+
+			this._resumeAfterThresholdStop = true;
+			return true;
 		};
 	}
 
@@ -1079,8 +1113,10 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
+		const resumeAfterThresholdStop = this._resumeAfterThresholdStop;
+		this._resumeAfterThresholdStop = false;
 		if (!msg) {
-			return false;
+			return resumeAfterThresholdStop;
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
@@ -1098,6 +1134,9 @@ export class AgentSession {
 		}
 
 		if (await this._checkCompaction(msg)) {
+			return true;
+		}
+		if (resumeAfterThresholdStop) {
 			return true;
 		}
 
@@ -2074,9 +2113,17 @@ export class AgentSession {
 			contextTokens = estimate.tokens;
 		} else {
 			contextTokens = directContextTokens;
+			const messages = this.agent.state.messages;
+			const estimate = estimateContextTokens(messages);
+			if (estimate.lastUsageIndex !== null) {
+				const usageMsg = messages[estimate.lastUsageIndex];
+				if (usageMsg.role === "assistant" && usageMsg.timestamp === assistantMessage.timestamp) {
+					contextTokens = Math.max(contextTokens, estimate.tokens);
+				}
+			}
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			return await this._runAutoCompaction("threshold", assistantMessage.stopReason === "toolUse");
 		}
 		return false;
 	}
